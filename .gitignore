@@ -1,0 +1,23 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# YOLO model weights (optional - these can be large; re-download instead of committing)
+*.pt
+*.onnx
+
+# VS Code settings
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Environment variables / secrets
+.env
