@@ -3,11 +3,10 @@ import mediapipe as mp
 import urllib.request
 import os
 import time
-import threading
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 MODEL_PATH = "hand_landmarker.task"
@@ -18,63 +17,50 @@ MODEL_URL = (
     "hand_landmarker.task"
 )
 
-# ------------------------------------------------------------
 # Camera
-# ------------------------------------------------------------
-
 CAMERA_INDEX = 0
-
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
+CAMERA_FPS = 30
 
-# ------------------------------------------------------------
-# Hand detector
-# ------------------------------------------------------------
-
+# Hand tracking
 MAX_HANDS = 1
 
-MIN_DETECTION_CONFIDENCE = 0.50
-MIN_PRESENCE_CONFIDENCE = 0.50
-MIN_TRACKING_CONFIDENCE = 0.50
+MIN_DETECTION_CONFIDENCE = 0.5
+MIN_PRESENCE_CONFIDENCE = 0.5
+MIN_TRACKING_CONFIDENCE = 0.5
 
-# ------------------------------------------------------------
-# Smoothing
-# ------------------------------------------------------------
+# Landmark smoothing
 #
-# Lower = more responsive
-# Higher = smoother
-#
-# 0.55 is intentionally fairly responsive.
-#
-
-SMOOTHING_ALPHA = 0.55
+# Higher = smoother but slightly less responsive
+# Lower  = more responsive but more jitter
+SMOOTHING_ALPHA = 0.45
 
 
 # ============================================================
-# HAND CONNECTIONS
+# HAND SKELETON CONNECTIONS
 # ============================================================
 
 HAND_CONNECTIONS = [
-
     # Thumb
     (0, 1),
     (1, 2),
     (2, 3),
     (3, 4),
 
-    # Index
+    # Index finger
     (0, 5),
     (5, 6),
     (6, 7),
     (7, 8),
 
-    # Middle
+    # Middle finger
     (0, 9),
     (9, 10),
     (10, 11),
     (11, 12),
 
-    # Ring
+    # Ring finger
     (0, 13),
     (13, 14),
     (14, 15),
@@ -99,11 +85,11 @@ HAND_CONNECTIONS = [
 
 def ensure_model():
 
-    if os.path.isfile(MODEL_PATH):
+    if os.path.exists(MODEL_PATH):
         return
 
     print("Hand model not found.")
-    print("Downloading...")
+    print("Downloading hand tracking model...")
 
     try:
 
@@ -115,12 +101,12 @@ def ensure_model():
     except Exception as error:
 
         print(
-            f"Could not download model: {error}"
+            f"Failed to download model: {error}"
         )
 
         raise SystemExit(1)
 
-    print("Model downloaded.")
+    print("Model downloaded successfully.")
 
 
 # ============================================================
@@ -129,90 +115,95 @@ def ensure_model():
 
 class LandmarkSmoother:
 
-    def __init__(self, alpha):
+    def __init__(self, alpha=0.45):
 
         self.alpha = alpha
-        self.points = None
+        self.previous = None
 
     def reset(self):
 
-        self.points = None
+        self.previous = None
 
     def update(self, landmarks):
 
-        if self.points is None:
+        # First frame
+        if self.previous is None:
 
-            self.points = [
-                [
-                    point[0],
-                    point[1],
-                    point[2]
-                ]
+            self.previous = [
+                tuple(point)
                 for point in landmarks
             ]
 
-            return self.points
+            return self.previous
 
         alpha = self.alpha
-        inverse = 1.0 - alpha
 
-        for i in range(len(landmarks)):
+        smoothed = []
 
-            self.points[i][0] = (
-                self.points[i][0] * inverse
+        for old, new in zip(
+            self.previous,
+            landmarks
+        ):
+
+            x = (
+                old[0] * (1.0 - alpha)
                 +
-                landmarks[i][0] * alpha
+                new[0] * alpha
             )
 
-            self.points[i][1] = (
-                self.points[i][1] * inverse
+            y = (
+                old[1] * (1.0 - alpha)
                 +
-                landmarks[i][1] * alpha
+                new[1] * alpha
             )
 
-            self.points[i][2] = (
-                self.points[i][2] * inverse
+            z = (
+                old[2] * (1.0 - alpha)
                 +
-                landmarks[i][2] * alpha
+                new[2] * alpha
             )
 
-        return self.points
+            smoothed.append(
+                (x, y, z)
+            )
+
+        self.previous = smoothed
+
+        return smoothed
 
 
 # ============================================================
 # DRAW HAND
 # ============================================================
 
-def draw_hand(frame, points):
+def draw_hand(
+    frame,
+    points
+):
 
     # --------------------------------------------------------
-    # Skeleton
+    # Draw skeleton
     # --------------------------------------------------------
 
     for start, end in HAND_CONNECTIONS:
 
+        x1 = int(points[start][0])
+        y1 = int(points[start][1])
+
+        x2 = int(points[end][0])
+        y2 = int(points[end][1])
+
         cv2.line(
             frame,
-
-            (
-                int(points[start][0]),
-                int(points[start][1])
-            ),
-
-            (
-                int(points[end][0]),
-                int(points[end][1])
-            ),
-
+            (x1, y1),
+            (x2, y2),
             (255, 255, 255),
-
             2,
-
             cv2.LINE_AA
         )
 
     # --------------------------------------------------------
-    # Joints
+    # Draw joints
     # --------------------------------------------------------
 
     for index, point in enumerate(points):
@@ -220,7 +211,7 @@ def draw_hand(frame, points):
         x = int(point[0])
         y = int(point[1])
 
-        # Make wrist + fingertips slightly larger
+        # Larger wrist and fingertips
         if index in (
             0,
             4,
@@ -229,20 +220,18 @@ def draw_hand(frame, points):
             16,
             20
         ):
-
-            outer = 6
-            inner = 3
+            outer_radius = 6
+            inner_radius = 3
 
         else:
+            outer_radius = 5
+            inner_radius = 2
 
-            outer = 5
-            inner = 2
-
-        # White outer circle
+        # White outer ring
         cv2.circle(
             frame,
             (x, y),
-            outer + 2,
+            outer_radius + 2,
             (255, 255, 255),
             -1,
             cv2.LINE_AA
@@ -252,7 +241,7 @@ def draw_hand(frame, points):
         cv2.circle(
             frame,
             (x, y),
-            inner,
+            inner_radius,
             (35, 35, 35),
             -1,
             cv2.LINE_AA
@@ -260,85 +249,76 @@ def draw_hand(frame, points):
 
 
 # ============================================================
-# CALLBACK RESULT STATE
-# ============================================================
-#
-# MediaPipe LIVE_STREAM calls this function on its own
-# processing thread.
-#
-# We only keep the MOST RECENT result.
-#
-# This is important:
-#
-# Old frames are useless for a real-time tracker.
-#
+# DRAW SIMPLE STATUS
 # ============================================================
 
-latest_result = None
-latest_timestamp = -1
-
-result_lock = threading.Lock()
-
-
-def result_callback(
-    result,
-    output_image,
-    timestamp_ms
+def draw_status(
+    frame,
+    hand_detected,
+    fps
 ):
 
-    global latest_result
-    global latest_timestamp
+    if hand_detected:
 
-    with result_lock:
+        text = "HAND TRACKING"
 
-        latest_result = result
-        latest_timestamp = timestamp_ms
+        text_color = (
+            0,
+            255,
+            0
+        )
+
+    else:
+
+        text = "NO HAND"
+
+        text_color = (
+            180,
+            180,
+            180
+        )
+
+    cv2.putText(
+        frame,
+        text,
+        (18, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        text_color,
+        2,
+        cv2.LINE_AA
+    )
+
+    # FPS
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (18, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA
+    )
+
+    # Quit instruction
+    cv2.putText(
+        frame,
+        "Q = quit",
+        (18, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (170, 170, 170),
+        1,
+        cv2.LINE_AA
+    )
 
 
 # ============================================================
-# FPS
-# ============================================================
-
-class FPSCounter:
-
-    def __init__(self):
-
-        self.last_time = time.perf_counter()
-
-        self.fps = 0.0
-
-    def update(self):
-
-        now = time.perf_counter()
-
-        dt = now - self.last_time
-
-        self.last_time = now
-
-        if dt > 0:
-
-            instant = 1.0 / dt
-
-            # Stable FPS display without affecting tracking
-            self.fps = (
-                self.fps * 0.90
-                +
-                instant * 0.10
-            )
-
-        return self.fps
-
-
-# ============================================================
-# INITIALIZE
+# MEDIAPIPE SETUP
 # ============================================================
 
 ensure_model()
-
-
-# ============================================================
-# MEDIAPIPE OPTIONS
-# ============================================================
 
 BaseOptions = mp.tasks.BaseOptions
 
@@ -361,10 +341,7 @@ options = HandLandmarkerOptions(
         model_asset_path=MODEL_PATH
     ),
 
-    # IMPORTANT:
-    # LIVE_STREAM is asynchronous and designed for
-    # camera/live input.
-    running_mode=RunningMode.LIVE_STREAM,
+    running_mode=RunningMode.VIDEO,
 
     num_hands=MAX_HANDS,
 
@@ -378,9 +355,7 @@ options = HandLandmarkerOptions(
 
     min_tracking_confidence=(
         MIN_TRACKING_CONFIDENCE
-    ),
-
-    result_callback=result_callback
+    )
 )
 
 
@@ -389,8 +364,7 @@ options = HandLandmarkerOptions(
 # ============================================================
 
 cap = cv2.VideoCapture(
-    CAMERA_INDEX,
-    cv2.CAP_DSHOW
+    CAMERA_INDEX
 )
 
 if not cap.isOpened():
@@ -402,10 +376,7 @@ if not cap.isOpened():
     raise SystemExit(1)
 
 
-# ------------------------------------------------------------
-# Camera configuration
-# ------------------------------------------------------------
-
+# Try to use requested camera settings
 cap.set(
     cv2.CAP_PROP_FRAME_WIDTH,
     CAMERA_WIDTH
@@ -416,74 +387,59 @@ cap.set(
     CAMERA_HEIGHT
 )
 
+cap.set(
+    cv2.CAP_PROP_FPS,
+    CAMERA_FPS
+)
+
+
 # ------------------------------------------------------------
-# Reduce buffering
+# Optional performance settings
 # ------------------------------------------------------------
 
+# Reduce internal buffering where supported.
 cap.set(
     cv2.CAP_PROP_BUFFERSIZE,
     1
 )
 
 
-# ------------------------------------------------------------
-# Try MJPG where supported.
-#
-# Many Windows webcams handle MJPG efficiently.
-# If the driver ignores it, nothing breaks.
-# ------------------------------------------------------------
-
-cap.set(
-    cv2.CAP_PROP_FOURCC,
-    cv2.VideoWriter_fourcc(
-        "M",
-        "J",
-        "P",
-        "G"
-    )
-)
-
-
 # ============================================================
-# TRACKING OBJECTS
+# STATE
 # ============================================================
 
 smoother = LandmarkSmoother(
     SMOOTHING_ALPHA
 )
 
-fps_counter = FPSCounter()
+timestamp_ms = 0
 
-frame_timestamp = 0
+previous_time = time.perf_counter()
 
-
-# Keep track of which result frame we have rendered.
-last_rendered_timestamp = -1
+fps = 0.0
 
 
 # ============================================================
-# START MEDIAPIPE
+# START
 # ============================================================
 
 print()
 print("============================================")
-print("        LOW-LATENCY HAND TRACKER")
+print("           HAND TRACKER")
 print("============================================")
 print()
-print(f"Camera      : {CAMERA_INDEX}")
-print(
-    f"Resolution  : "
-    f"{CAMERA_WIDTH}x{CAMERA_HEIGHT}"
-)
-print(
-    f"Max hands   : {MAX_HANDS}"
-)
+print("Webcam:", CAMERA_INDEX)
+print("Resolution:", CAMERA_WIDTH, "x", CAMERA_HEIGHT)
+print("Hands:", MAX_HANDS)
 print()
-print("Live stream mode: ON")
 print("Press Q to quit.")
 print("============================================")
 print()
 
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 with HandLandmarker.create_from_options(
     options
@@ -491,44 +447,45 @@ with HandLandmarker.create_from_options(
 
     while True:
 
-        # ====================================================
-        # CAPTURE FRAME
-        # ====================================================
+        # ----------------------------------------------------
+        # Capture frame
+        # ----------------------------------------------------
 
-        success, frame = cap.read()
+        ret, frame = cap.read()
 
-        if not success:
+        if not ret:
 
             print(
-                "ERROR: Could not read camera frame."
+                "ERROR: Failed to read webcam frame."
             )
 
             break
 
-
-        # ====================================================
-        # MIRROR
-        # ====================================================
+        # ----------------------------------------------------
+        # Mirror
+        # ----------------------------------------------------
 
         frame = cv2.flip(
             frame,
             1
         )
 
-
         height, width = frame.shape[:2]
 
 
-        # ====================================================
-        # SEND FRAME TO MEDIAPIPE
-        # ====================================================
+        # ----------------------------------------------------
+        # Convert BGR -> RGB
+        # ----------------------------------------------------
 
-        # Convert only what MediaPipe needs.
         rgb = cv2.cvtColor(
             frame,
             cv2.COLOR_BGR2RGB
         )
 
+
+        # ----------------------------------------------------
+        # MediaPipe image
+        # ----------------------------------------------------
 
         mp_image = mp.Image(
             image_format=mp.ImageFormat.SRGB,
@@ -536,53 +493,43 @@ with HandLandmarker.create_from_options(
         )
 
 
-        # LIVE_STREAM requires monotonically increasing
-        # timestamps.
-        frame_timestamp += 1
+        # ----------------------------------------------------
+        # Timestamp
+        # ----------------------------------------------------
+
+        # MediaPipe VIDEO mode requires increasing timestamps.
+        timestamp_ms += 1
 
 
-        landmarker.detect_async(
+        # ----------------------------------------------------
+        # Hand detection
+        # ----------------------------------------------------
+
+        result = landmarker.detect_for_video(
             mp_image,
-            frame_timestamp
+            timestamp_ms
         )
-
-
-        # ====================================================
-        # GET LATEST RESULT
-        # ====================================================
-
-        with result_lock:
-
-            result = latest_result
-            result_timestamp = latest_timestamp
 
 
         hand_detected = False
 
 
         # ====================================================
-        # DRAW THE MOST RECENT HAND RESULT
+        # HAND FOUND
         # ====================================================
 
-        if (
-            result is not None
-            and
-            result.hand_landmarks
-            and
-            result_timestamp != last_rendered_timestamp
-        ):
+        if result.hand_landmarks:
 
             hand_detected = True
 
-            # First hand only.
+            # We only requested one hand
             hand = result.hand_landmarks[0]
 
-
-            # ------------------------------------------------
-            # Convert normalized coordinates to pixels.
-            # ------------------------------------------------
-
             raw_points = []
+
+            # ------------------------------------------------
+            # Convert normalized landmarks into pixel space
+            # ------------------------------------------------
 
             for landmark in hand:
 
@@ -596,7 +543,7 @@ with HandLandmarker.create_from_options(
 
 
             # ------------------------------------------------
-            # Smooth the landmarks.
+            # Smooth landmarks
             # ------------------------------------------------
 
             points = smoother.update(
@@ -605,7 +552,7 @@ with HandLandmarker.create_from_options(
 
 
             # ------------------------------------------------
-            # Draw.
+            # Draw skeleton
             # ------------------------------------------------
 
             draw_hand(
@@ -614,38 +561,14 @@ with HandLandmarker.create_from_options(
             )
 
 
-            last_rendered_timestamp = (
-                result_timestamp
-            )
-
-
-        elif result is None:
-
-            # No result has arrived yet.
-            hand_detected = False
-
+        # ====================================================
+        # NO HAND
+        # ====================================================
 
         else:
 
-            # Result hasn't changed since the last frame.
-            #
-            # We deliberately DON'T rerun calculations.
-            # We just display the camera frame.
-            hand_detected = bool(
-                result.hand_landmarks
-            )
-
-
-        # ====================================================
-        # IF HAND DISAPPEARS
-        # ====================================================
-
-        if (
-            result is not None
-            and
-            not result.hand_landmarks
-        ):
-
+            # Reset smoother so the next hand does not
+            # interpolate from an old position.
             smoother.reset()
 
 
@@ -653,88 +576,34 @@ with HandLandmarker.create_from_options(
         # FPS
         # ====================================================
 
-        fps = fps_counter.update()
+        current_time = time.perf_counter()
 
-
-        # ====================================================
-        # RESULT AGE
-        # ====================================================
-
-        # This isn't exact end-to-end camera latency, but it
-        # helps identify whether the latest inference result
-        # is falling behind the camera.
-        #
-        result_age = 0.0
-
-        if result_timestamp >= 0:
-
-            result_age = max(
-                0,
-                frame_timestamp -
-                result_timestamp
-            )
-
-
-        # ====================================================
-        # STATUS
-        # ====================================================
-
-        if hand_detected:
-
-            status = "HAND TRACKING"
-
-            status_color = (
-                0,
-                255,
-                0
-            )
-
-        else:
-
-            status = "SEARCHING"
-
-            status_color = (
-                180,
-                180,
-                180
-            )
-
-
-        cv2.putText(
-            frame,
-            status,
-            (15, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            status_color,
-            2,
-            cv2.LINE_AA
+        delta = (
+            current_time -
+            previous_time
         )
 
+        previous_time = current_time
 
-        # FPS
-        cv2.putText(
+        if delta > 0:
+
+            instant_fps = 1.0 / delta
+
+            # Smooth FPS display
+            fps = (
+                fps * 0.90 +
+                instant_fps * 0.10
+            )
+
+
+        # ====================================================
+        # UI
+        # ====================================================
+
+        draw_status(
             frame,
-            f"FPS: {fps:.1f}",
-            (15, 53),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.43,
-            (220, 220, 220),
-            1,
-            cv2.LINE_AA
-        )
-
-
-        # Result age
-        cv2.putText(
-            frame,
-            f"Result age: {result_age} frames",
-            (15, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.40,
-            (190, 190, 190),
-            1,
-            cv2.LINE_AA
+            hand_detected,
+            fps
         )
 
 
@@ -743,7 +612,7 @@ with HandLandmarker.create_from_options(
         # ====================================================
 
         cv2.imshow(
-            "Low Latency Hand Tracker",
+            "Hand Tracker",
             frame
         )
 
