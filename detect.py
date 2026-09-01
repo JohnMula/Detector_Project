@@ -1,76 +1,82 @@
 import cv2
 import mediapipe as mp
-import numpy as np
 import urllib.request
 import os
 import time
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MODEL_PATH = "pose_landmarker.task"
+MODEL_PATH = "hand_landmarker.task"
 
-# "lite" = fastest / least accurate, "full" = balanced (used here),
-# "heavy" = most accurate / slowest. Swap the filename below to change.
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
-    "pose_landmarker/pose_landmarker_full/float16/1/"
-    "pose_landmarker_full.task"
+    "hand_landmarker/hand_landmarker/float16/1/"
+    "hand_landmarker.task"
 )
 
 # Camera
 CAMERA_INDEX = 0
-CAMERA_WIDTH = 960          # wider frame so a full standing body fits
-CAMERA_HEIGHT = 720
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
-# Pose tracking
-MAX_POSES = 1
+# Hand tracking
+MAX_HANDS = 1
+
 MIN_DETECTION_CONFIDENCE = 0.5
 MIN_PRESENCE_CONFIDENCE = 0.5
 MIN_TRACKING_CONFIDENCE = 0.5
 
-# Don't draw/smooth a landmark unless the model is at least this
-# confident it's actually visible (not occluded / off-screen).
-MIN_VISIBILITY = 0.5
+# Landmark smoothing
+#
+# Higher = smoother but slightly less responsive
+# Lower  = more responsive but more jitter
+SMOOTHING_ALPHA = 0.45
 
-# Landmark smoothing (higher = smoother, lower = more responsive)
-SMOOTHING_ALPHA = 0.4
-
-NUM_LANDMARKS = 33
 
 # ============================================================
-# POSE SKELETON CONNECTIONS (standard 33-point MediaPipe layout)
+# HAND SKELETON CONNECTIONS
 # ============================================================
 
-POSE_CONNECTIONS = np.array([
-    # Face
-    (0, 1), (1, 2), (2, 3), (3, 7),
-    (0, 4), (4, 5), (5, 6), (6, 8),
+HAND_CONNECTIONS = [
+    # Thumb
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+
+    # Index finger
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+
+    # Middle finger
+    (0, 9),
     (9, 10),
+    (10, 11),
+    (11, 12),
 
-    # Torso
-    (11, 12), (11, 23), (12, 24), (23, 24),
+    # Ring finger
+    (0, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
 
-    # Left arm
-    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    # Pinky
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
 
-    # Right arm
-    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
-
-    # Left leg
-    (23, 25), (25, 27), (27, 29), (27, 31), (29, 31),
-
-    # Right leg
-    (24, 26), (26, 28), (28, 30), (28, 32), (30, 32),
-], dtype=np.int32)
-
-# Bigger joints for the major landmarks people actually care about
-KEY_JOINTS = {0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28}
-
-WHITE = (255, 255, 255)
-DARK = (35, 35, 35)
+    # Palm
+    (5, 9),
+    (9, 13),
+    (13, 17),
+]
 
 
 # ============================================================
@@ -78,130 +84,354 @@ DARK = (35, 35, 35)
 # ============================================================
 
 def ensure_model():
+
     if os.path.exists(MODEL_PATH):
         return
-    print("Downloading pose tracking model...")
+
+    print("Hand model not found.")
+    print("Downloading hand tracking model...")
+
     try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+
+        urllib.request.urlretrieve(
+            MODEL_URL,
+            MODEL_PATH
+        )
+
     except Exception as error:
-        print(f"Failed to download model: {error}")
+
+        print(
+            f"Failed to download model: {error}"
+        )
+
         raise SystemExit(1)
-    print("Model downloaded.")
+
+    print("Model downloaded successfully.")
 
 
 # ============================================================
-# LANDMARK SMOOTHER (vectorized, size-agnostic)
+# LANDMARK SMOOTHER
 # ============================================================
 
 class LandmarkSmoother:
 
-    __slots__ = ("alpha", "previous")
+    def __init__(self, alpha=0.45):
 
-    def __init__(self, alpha=0.4):
         self.alpha = alpha
         self.previous = None
 
     def reset(self):
+
         self.previous = None
 
-    def update(self, landmarks, visible_mask):
+    def update(self, landmarks):
+
+        # First frame
         if self.previous is None:
-            self.previous = landmarks.copy()
-            self.previous[~visible_mask] = np.nan
+
+            self.previous = [
+                tuple(point)
+                for point in landmarks
+            ]
+
             return self.previous
 
-        # Only blend points that are currently visible; frozen
-        # (not overwritten with a guess) where visibility is low,
-        # so occluded joints don't jitter toward noise.
-        blend = visible_mask
-        self.previous[blend] += (
-            (landmarks[blend] - self.previous[blend]) * self.alpha
-        )
-        return self.previous
+        alpha = self.alpha
+
+        smoothed = []
+
+        for old, new in zip(
+            self.previous,
+            landmarks
+        ):
+
+            x = (
+                old[0] * (1.0 - alpha)
+                +
+                new[0] * alpha
+            )
+
+            y = (
+                old[1] * (1.0 - alpha)
+                +
+                new[1] * alpha
+            )
+
+            z = (
+                old[2] * (1.0 - alpha)
+                +
+                new[2] * alpha
+            )
+
+            smoothed.append(
+                (x, y, z)
+            )
+
+        self.previous = smoothed
+
+        return smoothed
 
 
 # ============================================================
-# DRAWING
+# DRAW HAND
 # ============================================================
 
-def draw_skeleton(frame, points_int, visible_mask):
-    for start, end in POSE_CONNECTIONS:
-        if not (visible_mask[start] and visible_mask[end]):
-            continue
+def draw_hand(
+    frame,
+    points
+):
+
+    # --------------------------------------------------------
+    # Draw skeleton
+    # --------------------------------------------------------
+
+    for start, end in HAND_CONNECTIONS:
+
+        x1 = int(points[start][0])
+        y1 = int(points[start][1])
+
+        x2 = int(points[end][0])
+        y2 = int(points[end][1])
+
         cv2.line(
             frame,
-            tuple(points_int[start]),
-            tuple(points_int[end]),
-            WHITE, 2, cv2.LINE_AA
+            (x1, y1),
+            (x2, y2),
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
         )
 
-    for index in range(NUM_LANDMARKS):
-        if not visible_mask[index]:
-            continue
-        x, y = points_int[index]
-        is_key = index in KEY_JOINTS
-        outer = 7 if is_key else 4
-        inner = 3 if is_key else 2
-        cv2.circle(frame, (x, y), outer, WHITE, -1, cv2.LINE_AA)
-        cv2.circle(frame, (x, y), inner, DARK, -1, cv2.LINE_AA)
+    # --------------------------------------------------------
+    # Draw joints
+    # --------------------------------------------------------
 
+    for index, point in enumerate(points):
 
-def draw_status(frame, pose_detected, fps):
-    text = "BODY TRACKING" if pose_detected else "NO BODY"
-    color = (0, 255, 0) if pose_detected else (180, 180, 180)
+        x = int(point[0])
+        y = int(point[1])
 
-    cv2.putText(frame, text, (18, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, color, 2, cv2.LINE_AA)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (18, 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(frame, "Q = quit", (18, 78),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1, cv2.LINE_AA)
+        # Larger wrist and fingertips
+        if index in (
+            0,
+            4,
+            8,
+            12,
+            16,
+            20
+        ):
+            outer_radius = 6
+            inner_radius = 3
+
+        else:
+            outer_radius = 5
+            inner_radius = 2
+
+        # White outer ring
+        cv2.circle(
+            frame,
+            (x, y),
+            outer_radius + 2,
+            (255, 255, 255),
+            -1,
+            cv2.LINE_AA
+        )
+
+        # Dark center
+        cv2.circle(
+            frame,
+            (x, y),
+            inner_radius,
+            (35, 35, 35),
+            -1,
+            cv2.LINE_AA
+        )
 
 
 # ============================================================
-# SETUP
+# DRAW SIMPLE STATUS
+# ============================================================
+
+def draw_status(
+    frame,
+    hand_detected,
+    fps
+):
+
+    if hand_detected:
+
+        text = "HAND TRACKING"
+
+        text_color = (
+            0,
+            255,
+            0
+        )
+
+    else:
+
+        text = "NO HAND"
+
+        text_color = (
+            180,
+            180,
+            180
+        )
+
+    cv2.putText(
+        frame,
+        text,
+        (18, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        text_color,
+        2,
+        cv2.LINE_AA
+    )
+
+    # FPS
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (18, 55),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA
+    )
+
+    # Quit instruction
+    cv2.putText(
+        frame,
+        "Q = quit",
+        (18, 78),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (170, 170, 170),
+        1,
+        cv2.LINE_AA
+    )
+
+
+# ============================================================
+# MEDIAPIPE SETUP
 # ============================================================
 
 ensure_model()
-cv2.setUseOptimized(True)
 
 BaseOptions = mp.tasks.BaseOptions
-PoseLandmarker = mp.tasks.vision.PoseLandmarker
-PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
-RunningMode = mp.tasks.vision.RunningMode
 
-options = PoseLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=RunningMode.VIDEO,
-    num_poses=MAX_POSES,
-    min_pose_detection_confidence=MIN_DETECTION_CONFIDENCE,
-    min_pose_presence_confidence=MIN_PRESENCE_CONFIDENCE,
-    min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+HandLandmarker = (
+    mp.tasks.vision.HandLandmarker
 )
 
-cap = cv2.VideoCapture(CAMERA_INDEX)
+HandLandmarkerOptions = (
+    mp.tasks.vision.HandLandmarkerOptions
+)
+
+RunningMode = (
+    mp.tasks.vision.RunningMode
+)
+
+
+options = HandLandmarkerOptions(
+
+    base_options=BaseOptions(
+        model_asset_path=MODEL_PATH
+    ),
+
+    running_mode=RunningMode.VIDEO,
+
+    num_hands=MAX_HANDS,
+
+    min_hand_detection_confidence=(
+        MIN_DETECTION_CONFIDENCE
+    ),
+
+    min_hand_presence_confidence=(
+        MIN_PRESENCE_CONFIDENCE
+    ),
+
+    min_tracking_confidence=(
+        MIN_TRACKING_CONFIDENCE
+    )
+)
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+cap = cv2.VideoCapture(
+    CAMERA_INDEX
+)
+
 if not cap.isOpened():
-    print("ERROR: Could not open webcam.")
+
+    print(
+        "ERROR: Could not open webcam."
+    )
+
     raise SystemExit(1)
 
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-smoother = LandmarkSmoother(SMOOTHING_ALPHA)
+# Try to use requested camera settings
+cap.set(
+    cv2.CAP_PROP_FRAME_WIDTH,
+    CAMERA_WIDTH
+)
 
-start_time = time.perf_counter()
-previous_time = start_time
+cap.set(
+    cv2.CAP_PROP_FRAME_HEIGHT,
+    CAMERA_HEIGHT
+)
+
+cap.set(
+    cv2.CAP_PROP_FPS,
+    CAMERA_FPS
+)
+
+
+# ------------------------------------------------------------
+# Optional performance settings
+# ------------------------------------------------------------
+
+# Reduce internal buffering where supported.
+cap.set(
+    cv2.CAP_PROP_BUFFERSIZE,
+    1
+)
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+smoother = LandmarkSmoother(
+    SMOOTHING_ALPHA
+)
+
+timestamp_ms = 0
+
+previous_time = time.perf_counter()
+
 fps = 0.0
+
+
+# ============================================================
+# START
+# ============================================================
 
 print()
 print("============================================")
-print("           FULL BODY TRACKER")
+print("           HAND TRACKER")
 print("============================================")
-print(f"Webcam: {CAMERA_INDEX}   Resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-print("Step back so your whole body is in frame.")
+print()
+print("Webcam:", CAMERA_INDEX)
+print("Resolution:", CAMERA_WIDTH, "x", CAMERA_HEIGHT)
+print("Hands:", MAX_HANDS)
+print()
 print("Press Q to quit.")
 print("============================================")
 print()
@@ -211,61 +441,200 @@ print()
 # MAIN LOOP
 # ============================================================
 
-with PoseLandmarker.create_from_options(options) as landmarker:
+with HandLandmarker.create_from_options(
+    options
+) as landmarker:
 
     while True:
+
+        # ----------------------------------------------------
+        # Capture frame
+        # ----------------------------------------------------
+
         ret, frame = cap.read()
+
         if not ret:
-            print("ERROR: Failed to read webcam frame.")
+
+            print(
+                "ERROR: Failed to read webcam frame."
+            )
+
             break
 
-        frame = cv2.flip(frame, 1)
+        # ----------------------------------------------------
+        # Mirror
+        # ----------------------------------------------------
+
+        frame = cv2.flip(
+            frame,
+            1
+        )
+
         height, width = frame.shape[:2]
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        timestamp_ms = int((time.perf_counter() - start_time) * 1000)
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        # ----------------------------------------------------
+        # Convert BGR -> RGB
+        # ----------------------------------------------------
 
-        pose_detected = bool(result.pose_landmarks)
+        rgb = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
+        )
 
-        if pose_detected:
-            pose = result.pose_landmarks[0]
 
-            raw_points = np.empty((NUM_LANDMARKS, 3), dtype=np.float32)
-            visibility = np.empty(NUM_LANDMARKS, dtype=np.float32)
+        # ----------------------------------------------------
+        # MediaPipe image
+        # ----------------------------------------------------
 
-            for i, lm in enumerate(pose):
-                raw_points[i, 0] = lm.x * width
-                raw_points[i, 1] = lm.y * height
-                raw_points[i, 2] = lm.z
-                visibility[i] = lm.visibility
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=rgb
+        )
 
-            visible_mask = visibility >= MIN_VISIBILITY
 
-            smoothed = smoother.update(raw_points, visible_mask)
-            points_int = smoothed[:, :2].astype(np.int32)
+        # ----------------------------------------------------
+        # Timestamp
+        # ----------------------------------------------------
 
-            draw_skeleton(frame, points_int, visible_mask)
+        # MediaPipe VIDEO mode requires increasing timestamps.
+        timestamp_ms += 1
+
+
+        # ----------------------------------------------------
+        # Hand detection
+        # ----------------------------------------------------
+
+        result = landmarker.detect_for_video(
+            mp_image,
+            timestamp_ms
+        )
+
+
+        hand_detected = False
+
+
+        # ====================================================
+        # HAND FOUND
+        # ====================================================
+
+        if result.hand_landmarks:
+
+            hand_detected = True
+
+            # We only requested one hand
+            hand = result.hand_landmarks[0]
+
+            raw_points = []
+
+            # ------------------------------------------------
+            # Convert normalized landmarks into pixel space
+            # ------------------------------------------------
+
+            for landmark in hand:
+
+                raw_points.append(
+                    (
+                        landmark.x * width,
+                        landmark.y * height,
+                        landmark.z
+                    )
+                )
+
+
+            # ------------------------------------------------
+            # Smooth landmarks
+            # ------------------------------------------------
+
+            points = smoother.update(
+                raw_points
+            )
+
+
+            # ------------------------------------------------
+            # Draw skeleton
+            # ------------------------------------------------
+
+            draw_hand(
+                frame,
+                points
+            )
+
+
+        # ====================================================
+        # NO HAND
+        # ====================================================
+
         else:
+
+            # Reset smoother so the next hand does not
+            # interpolate from an old position.
             smoother.reset()
 
+
+        # ====================================================
+        # FPS
+        # ====================================================
+
         current_time = time.perf_counter()
-        delta = current_time - previous_time
+
+        delta = (
+            current_time -
+            previous_time
+        )
+
         previous_time = current_time
+
         if delta > 0:
-            fps = fps * 0.90 + (1.0 / delta) * 0.10
 
-        draw_status(frame, pose_detected, fps)
+            instant_fps = 1.0 / delta
 
-        cv2.imshow("Body Tracker", frame)
+            # Smooth FPS display
+            fps = (
+                fps * 0.90 +
+                instant_fps * 0.10
+            )
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+
+        # ====================================================
+        # UI
+        # ====================================================
+
+        draw_status(
+            frame,
+            hand_detected,
+            fps
+        )
+
+
+        # ====================================================
+        # DISPLAY
+        # ====================================================
+
+        cv2.imshow(
+            "Hand Tracker",
+            frame
+        )
+
+
+        # ====================================================
+        # QUIT
+        # ====================================================
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+
             break
 
 
+# ============================================================
+# CLEANUP
+# ============================================================
+
 cap.release()
+
 cv2.destroyAllWindows()
+
 print()
-print("Body tracker stopped.")
+print("Hand tracker stopped.")
