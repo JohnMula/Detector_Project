@@ -637,4 +637,4 @@ cap.release()
 cv2.destroyAllWindows()
 
 print()
-print("Hand tracker stopped.")
+print("Hand tracker stopped. ")
